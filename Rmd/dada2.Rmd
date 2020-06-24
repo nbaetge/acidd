@@ -1,0 +1,267 @@
+---
+title: "dada2"
+author: "Nicholas Baetge"
+date: "6/23/2020"
+output: github_document
+---
+
+This script processes trimmed (w/o primers) sequences through the [DADA2 (1.6) pipeline](https://benjjneb.github.io/dada2/tutorial.html)
+
+# Install DADA2 from Bioconductor
+
+```{r message = F, warning = F}
+# if (!requireNamespace("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install("dada2", version = "3.11")
+```
+
+
+# Load packages
+
+```{r message = F, warning = F}
+library(tidyverse)
+library(dada2)
+library(ShortRead)
+```
+
+# Import data
+
+```{r}
+#save the path to the directory with a COPY of your unzipped fastq files that you will work with. MAKE SURE YOU HAVE ANOTHER DIRECTORY WITH THE FILES THAT YOU WILL NEVER DIRECTLY WORK WITH. 
+path <- "~/GITHUB/acidd/16S/cast_fastq_COPY" #make sure there isn't a "/" at the end of the path
+#also make sure that there are no unzipped files here
+
+#paths for filtering script - change these to where your raw reads are
+pathF <- path # see above^
+pathR <- path # see above^
+
+#store names of forward and reverse files as lists
+fnFs <- sort(list.files(path, pattern = "_R1_001.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern = "_R2_001.fastq", full.names = TRUE))
+```
+
+# Retrieve orientation of primers
+
+This part stores all the orientations of the primers, so that we can look for them when we want to trim them out 
+
+```{r}
+#store the  forward and reverse primers
+FWD = "GTGYCAGCMGCCGCGGTAA"
+REV = "GGACTACNVGGGTWTCTAAT"
+
+#now store all the orientations of your forward and reverse  primers
+allOrients <- function(primer) {
+  # The Biostrings works w/ DNAString objects rather than character vectors
+  require(Biostrings)
+  dna <- DNAString(primer) 
+  orients <- c(Forward = dna, Complement = complement(dna), Reverse = reverse(dna), 
+               RevComp = reverseComplement(dna))
+  # Convert back to character vector
+  return(sapply(orients, toString))  
+}
+
+#store the fwd and reverse oreintations separately
+FWD.orients <- allOrients(FWD)
+REV.orients <- allOrients(REV)
+
+#view the orientations of the primers
+FWD.orients
+REV.orients
+
+```
+
+# Filter out all sequences with ambiguous base calls
+
+This part looks at the raw sequencing reads and removes reads with [ambiguous base calls (i.e. N)](https://www.bioinformatics.org/sms/iupac.html). The subsequent workflow can't filter out primers properly if reads have "N" bases in them. 
+
+```{r}
+# Put N-filtered files in filtN/ subdirectory
+fnFs.filtN <- file.path(path, "filtN", basename(fnFs)) 
+fnRs.filtN <- file.path(path, "filtN", basename(fnRs))
+
+#filter out any reads that contain "N" in the sequence (search IUPAC ambiguity codes for descriptions)
+filterAndTrim(fwd = file.path(fnFs), filt = fnFs.filtN, rev = file.path(fnRs), filt.rev = fnRs.filtN, maxN = 0)
+```
+# Remove primers
+
+This part searches for primers in all the orientations and removes them from all the remaining filtered sequences
+
+```{r}
+primerHits <- function(primer, fn) {
+  # Counts number of reads in which the primer is found
+  nhits <- vcountPattern(primer, sread(readFastq(fn)), fixed = FALSE)
+  return(sum(nhits > 0))
+}
+
+rbind(FWD.ForwardReads = sapply(FWD.orients, primerHits, fn = fnFs.filtN[[1]]), 
+      FWD.ReverseReads = sapply(FWD.orients, primerHits, fn = fnRs.filtN[[1]]), 
+      REV.ForwardReads = sapply(REV.orients, primerHits, fn = fnFs.filtN[[1]]), 
+      REV.ReverseReads = sapply(REV.orients, primerHits, fn = fnRs.filtN[[1]]))
+
+```
+
+At this point a 4X4 table is returned. If all the numbers are 0, then you don't have primers in your sequences :) If they have numbers, use cutadapt to remove the primers, appropriately. If there are only hits of the reverse complement in the FWD.ReverseReads and the REV.ForwardReads, that is ok - it indicates that the reads are long enough to get the primers on the end. We can trim those out with the MergePairs function later, by adding trimOverhang=T.
+
+# Inspect read quality profiles
+
+You should look at least some of the quality profiles to assess the quality of the sequencing run.  Typically, the reverse reads will often be poorer quality than the forward reads, particular at the ends. Use this information to decide where to uniformly trim your reads. If you have low quality scores throughout the reads, then you may want to resequence your samples
+
+```{r echo = FALSE, warning = FALSE, message = FALSE, fig.height = 10, fig.width = 12, fig.align = "center", warning = FALSE}
+plotQualityProfile(fnFs[1:10])
+```
+
+```{r echo = FALSE, warning = FALSE, message = FALSE, fig.height = 10, fig.width = 12, fig.align = "center", warning = FALSE}
+plotQualityProfile(fnRs[1:10])
+```
+
+# Filtering and Trimming
+
+```{r}
+#Get the sample names
+#define the basename of the FnFs as the first part of each fastQ file name until "_L"
+#apply this to all samples
+sample.names <- sapply(strsplit(basename(fnFs),"_L"), `[`,1)
+sample.names
+
+#create a "filtered" folder in the working directory as a place to put all the new filtered fastQ files
+filt_path <- file.path(path,"filtered")
+
+#add the appropriate designation string to any new files made that will be put into the "filtered" folder
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq"))
+```
+
+Below is the actual filtering step. 
+1. dada2 generally advises trimming last few nucleotides for weird sequencing errors that can pop up there.
+2. maxEE is the max number of expected errors (calc'ed from Q's) to allow in each read. This is a probability calculation.
+3. minQ is a threshold Q - and read with a Q < minQ after truncating reads gets discarded. This isn't that important for 16/18S
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen = c(225,150),  maxN = 0, maxEE = c(2,2), truncQ = 2, rm.phix = TRUE, compress = TRUE) 
+
+#look at the output. this tells you how many reads were removed. 
+readsinout <- out
+```
+
+# Learn the error rates
+
+The dada2 algorithm makes use of a parametric error model (err) as every amplicon dataset has a different set of error rates. This is what dada2 is all about. This step creates the parameters for designating unique sequences.
+
+Each sequence has an x number of reads. dada2 uses the numbers of reads per sequence as well as the q-score to build this model. This algorithm assumes that your most abundant sequence is real. There is a very high probability that it is.
+
+What the algorithim does that looks at each base pair of an individul sequence and calculates the probabilty that the base pair is an error based on the quality score of the read and the sequence of your most abundant read. It also does this for the second most abundant sequence, etc etc. hence the message "convergence after x rounds" after running the algorithm.
+
+```{r}
+errF <- learnErrors(filtFs, multithread = TRUE)
+errR <- learnErrors(filtRs, multithread = TRUE)
+```
+
+```{r echo = FALSE, warning = FALSE, message = FALSE, fig.height = 10, fig.width = 12, fig.align = "center", warning = FALSE}
+plotErrors(errF, nominalQ = TRUE)
+```
+
+```{r echo = FALSE, warning = FALSE, message = FALSE, fig.height = 10, fig.width = 12, fig.align = "center", warning = FALSE}
+plotErrors(errR, nominalQ = TRUE)
+```
+
+# Dereplication 
+
+This is another big thing that dada2 does. It combines all identical sequences into one unique sequence, keeping track of the number of identical sequences.
+
+```{r}
+derepFs <- derepFastq(filtFs, verbose = TRUE)
+derepRs <- derepFastq(filtRs, verbose = TRUE)
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+# Infer the sequence variants
+
+Apply the core dada2 sample inference algorithm to the dereplicated data. 
+
+Infer the sequence variants in each sample, taking out the sequence variants that have excessive error rates.
+
+So here, we are applying the error models to the data. Before, the error models were run using a subset of the data (parameterizing). Now, we're using the parameters of the model and applying it to the whole data set to see which sequences are real and which are not. 
+
+```{r}
+dadaFs <- dada(derepFs, err = errF, multithread = TRUE)
+dadaRs <- dada(derepRs, err = errR, multithread = TRUE)
+```
+
+merge the overlapping reads -> this will also decrease the number of sequence variants
+
+```{r}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose = TRUE, trimOverhang = TRUE)
+```
+
+inspect the merged data frame from the first sample. this will output a table. the numbers in the forward and reverse columns tell where those sequences are in the dadaFs and dadaRs files. nmatch is how many bases matched. we uniformly trimmed the amplicons so they should all be the same. 
+
+```{r}
+head(mergers[[1]])
+```
+
+save the unassigned merged reads
+
+```{r}
+saveRDS(mergers, "~/GITHUB/acidd/16S/cast_output/dada_merged.rds")
+```
+
+
+
+construct a sequence table of our samples that is analagous to the "OTU table" produced by classical methods
+
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+
+check the distribution of sequence lengths
+
+```{r}
+table(nchar(getSequences(seqtab)))
+```
+
+# Remove the Chimeras
+
+in PCR, two or more biological sequences can attach to each other and then polymerase builds a non-biological sequence. Weird. These are artefacts that need to be removed.
+
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, verbose = TRUE)
+dim(seqtab.nochim)
+```
+
+check the proportion of sequences that are not chimeras
+
+```{r}
+sum(seqtab.nochim)/sum(seqtab)
+```
+
+# Assign taxonomy using a reference database
+
+here we are referencing the Silva database
+
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim, "~/GITHUB/acidd/16S/taxanomic_reference/silva_nr_v138_train_set.fa", multithread = TRUE)
+```
+
+create a table out of the taxa data (one with the sequences and assigments, one with just all the taxa)
+
+these are the tables you want to save!!
+
+```{r}
+write.table(t(seqtab.nochim), "~/GITHUB/acidd/16S/cast_output/seqtab-nochimtaxa.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+write.table(taxa,"~/GITHUB/acidd/16S/cast_output/taxa.txt", sep = "\t", row.names = TRUE, col.names = NA, quote = FALSE)
+```
+
+
+
+
+
+
+
+
+
+
+
+
