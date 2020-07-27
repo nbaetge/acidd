@@ -173,10 +173,14 @@ interpolations.df <- plyr::ldply(interpolations.list, data.frame) %>%
 #combine the interpolated and non-interpolated data frames
 interpolations.df$Station <- as.numeric(interpolations.df$Station)
 interpolated.df <- left_join(collapsed.df, interpolations.df) 
+
+#add DNA IDs back to dataframe
+
+processed.df <- left_join(interpolated.df, dna)
 ```
 
 # Save Dataset
 
 ``` r
-saveRDS(interpolated.df,"~/GITHUB/acidd/Output/processed_bf.rds")
+saveRDS(processed.df,"~/GITHUB/acidd/Output/processed_bf.rds")
 ```
